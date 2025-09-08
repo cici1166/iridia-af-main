@@ -11,6 +11,10 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from common.model_v2 import AFPredictionModelV2
 from tqdm import tqdm
 
+# === NEW ===
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
 # 防止 Windows 下中文输出乱码
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -112,8 +116,55 @@ def evaluate_metrics(pred_probs, labels):
     preds = [1 if p >= 0.5 else 0 for p in pred_probs]
     acc = accuracy_score(labels, preds)
     f1 = f1_score(labels, preds)
-    auc = roc_auc_score(labels, pred_probs)
-    return {'acc': acc, 'f1': f1, 'auc': auc}
+    auc_val = roc_auc_score(labels, pred_probs)
+    return {'acc': acc, 'f1': f1, 'auc': auc_val}
+
+# === NEW: 画图 & 收集概率的工具函数 ===
+def collect_probs_and_labels(model, loader, device):
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for ecg, label in loader:
+            ecg = ecg.to(device)
+            logits = model(ecg).squeeze()
+            probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+            all_probs.extend(probs)
+            all_labels.extend(np.array(label))
+    return np.array(all_probs), np.array(all_labels)
+
+def plot_learning_curves(history, save_path='learning_curves.png'):
+    # history: dict with keys ['val_loss', 'val_auc']
+    epochs = np.arange(1, len(history['val_loss']) + 1)
+    fig, ax1 = plt.subplots(figsize=(7,5))
+    ax1.plot(epochs, history['val_loss'], label='Val Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Val Loss')
+    ax1.grid(True, linestyle='--', alpha=0.4)
+    ax2 = ax1.twinx()
+    ax2.plot(epochs, history['val_auc'], label='Val AUC', linestyle='--')
+    ax2.set_ylabel('Val AUC')
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+def plot_roc_two_curves(prob_label_tuple_1, prob_label_tuple_2, names=('Val','Test'), save_path='roc_val_test.png'):
+    fig, ax = plt.subplots(figsize=(6,6))
+    for (probs, labels), name in zip([prob_label_tuple_1, prob_label_tuple_2], names):
+        fpr, tpr, _ = roc_curve(labels, probs)
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, lw=2, label=f'{name} ROC (AUC = {roc_auc:.3f})')
+    ax.plot([0,1], [0,1], color='gray', lw=1, linestyle='--')
+    ax.set_xlim([0.0, 1.0]); ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+    ax.set_title('ROC Curves (Val vs Test)')
+    ax.legend(loc='lower right')
+    ax.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
 # 主程序
 if __name__ == '__main__':
@@ -122,9 +173,11 @@ if __name__ == '__main__':
         data_h5 = 'dataset/processed_data.h5'
         train_csv = 'splits/train.csv'
         val_csv = 'splits/val.csv'
+        # === NEW ===
+        test_csv = 'splits/test.csv'
         
         batch_size = 16
-        num_epochs = 50
+        num_epochs = 3
         lr = 1e-4
         weight_decay = 1e-5
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -134,6 +187,7 @@ if __name__ == '__main__':
         print(f"数据文件: {data_h5}")
         print(f"训练集文件: {train_csv}")
         print(f"验证集文件: {val_csv}")
+        print(f"测试集文件: {test_csv}")  # === NEW ===
         print(f"设备: {device}")
         print(f"批次大小: {batch_size}")
         print(f"学习率: {lr}")
@@ -144,6 +198,8 @@ if __name__ == '__main__':
         print("\n=== 加载数据 ===")
         train_dataset = ECGDataset(data_h5, train_csv)
         val_dataset = ECGDataset(data_h5, val_csv)
+        # === NEW ===
+        test_dataset = ECGDataset(data_h5, test_csv)
 
         # 计算类别权重
         print("\n=== 计算类别权重 ===")
@@ -178,6 +234,14 @@ if __name__ == '__main__':
             num_workers=0,
             pin_memory=True if torch.cuda.is_available() else False
         )
+        # === NEW ===
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True if torch.cuda.is_available() else False
+        )
 
         # 创建模型
         print("\n=== 创建模型 ===")
@@ -203,6 +267,9 @@ if __name__ == '__main__':
             patience=5
         )
 
+        # === NEW === 学习曲线容器
+        history = {'val_loss': [], 'val_auc': []}
+
         # 训练循环
         best_auc = 0.0
         best_epoch = 0
@@ -221,6 +288,10 @@ if __name__ == '__main__':
             print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
             print(f"Train - Acc: {train_metrics['acc']:.4f} | F1: {train_metrics['f1']:.4f} | AUC: {train_metrics['auc']:.4f}")
             print(f"Val   - Acc: {val_metrics['acc']:.4f} | F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f}")
+
+            # === NEW === 记录学习曲线数据
+            history['val_loss'].append(val_loss)
+            history['val_auc'].append(val_metrics['auc'])
 
             # 更新学习率
             scheduler.step(val_metrics['auc'])
@@ -252,7 +323,53 @@ if __name__ == '__main__':
         print("\n训练完成！")
         print(f"最佳模型在 epoch {best_epoch}，AUC: {best_auc:.4f}")
 
+        # === NEW === 训练后：画学习曲线、评估 Val/Test、画 ROC、导出 CSV
+        try:
+            plot_learning_curves(history, save_path='learning_curves.png')
+            print("Saved: learning_curves.png")
+
+            # 加载最佳模型
+            best_ckpt = torch.load('best_model_v2.pt', map_location=deviceweights_only=False)
+            best_model = AFPredictionModelV2().to(device)
+            best_model.load_state_dict(best_ckpt['model_state_dict'])
+            best_model.eval()
+
+            # 收集概率与标签
+            val_probs, val_labels = collect_probs_and_labels(best_model, val_loader, device)
+            test_probs, test_labels = collect_probs_and_labels(best_model, test_loader, device)
+
+            # 画 ROC
+            plot_roc_two_curves(
+                (val_probs, val_labels),
+                (test_probs, test_labels),
+                names=('Val', 'Test'),
+                save_path='roc_val_test.png'
+            )
+            print("Saved: roc_val_test.png")
+
+            # 导出结果表（阈值=0.5）
+            from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+            def metrics_from_probs(probs, labels, thr=0.5):
+                preds = (probs >= thr).astype(int)
+                return {
+                    'acc': accuracy_score(labels, preds),
+                    'f1': f1_score(labels, preds),
+                    'auc': roc_auc_score(labels, probs)
+                }
+            val_results = metrics_from_probs(val_probs, val_labels, thr=0.5)
+            test_results = metrics_from_probs(test_probs, test_labels, thr=0.5)
+
+            df_out = pd.DataFrame([
+                {'split': 'Val',  'Accuracy': val_results['acc'],  'F1': val_results['f1'],  'AUC': val_results['auc']},
+                {'split': 'Test', 'Accuracy': test_results['acc'], 'F1': test_results['f1'], 'AUC': test_results['auc']},
+            ])
+            df_out.to_csv('results_val_test.csv', index=False)
+            print("Saved: results_val_test.csv")
+
+        except Exception as e:
+            print(f"[Post-Train] 生成图表/结果时出错：{e}")
+
     except Exception as e:
         print(f"\n训练过程中出错: {str(e)}")
         import traceback
-        traceback.print_exc() 
+        traceback.print_exc()
